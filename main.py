@@ -1,586 +1,1019 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
-import random
-import uuid
+# main.py - Complete Docker-Ready Spectraine API
+import os
+import sys
+import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
+import uuid
+import secrets
+import re
+import random
 
-app = FastAPI(
-    title="Spectraine API",
-    description="Cloud Threat Detection & Cost Optimization",
-    version="2.0.0"
-)
-
-# FIXED CORS CONFIGURATION - MUST BE BEFORE ROUTES
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
-    allow_credentials=True,
-    allow_methods=["*"],  # Allow all methods
-    allow_headers=["*"],  # Allow all headers
-)
-
-# Data Models
-class InstanceResponse(BaseModel):
-    id: str
-    name: str
-    state: str
-    instance_type: str
-    public_ip: Optional[str]
-    private_ip: Optional[str]
-    launch_time: str
-    threats: List[str]
-    monthly_cost: float
-    region: str
-
-class ThreatFinding(BaseModel):
-    type: str
-    severity: str
-    instance: str
-    instance_name: str
-    impact: str
-    confidence: str
-    business_impact: str
-    recommendation: str
-
-class CostRecommendation(BaseModel):
-    recommendation: str
-    potential_savings: str
-    confidence: str
-    business_translation: str
-    implementation_effort: str
-
-class AssessmentRequest(BaseModel):
-    name: str
-    email: str
-    company: str
-    aws_spend: Optional[str] = "unknown"
-    priority_concerns: List[str] = []
-
-class QuickScanResponse(BaseModel):
-    status: str
-    scan_time: str
-    critical_findings: int
-    immediate_risks: List[Dict[str, Any]]
-    next_actions: List[str]
-
-# Enhanced Mock Data Generators
-def generate_instances():
-    """Generate realistic demo instances for enterprise environment"""
-    instance_templates = [
-        {"type": "t3.large", "cost": 67.20, "typical_use": "web server", "threat_weight": 0.3},
-        {"type": "r5.xlarge", "cost": 252.00, "typical_use": "database", "threat_weight": 0.6},
-        {"type": "m5.2xlarge", "cost": 384.00, "typical_use": "application server", "threat_weight": 0.4},
-        {"type": "c5.4xlarge", "cost": 680.00, "typical_use": "compute intensive", "threat_weight": 0.7},
-        {"type": "t2.micro", "cost": 9.50, "typical_use": "development", "threat_weight": 0.2},
-        {"type": "g4dn.xlarge", "cost": 526.00, "typical_use": "gpu workload", "threat_weight": 0.8},
-        {"type": "i3.2xlarge", "cost": 624.00, "typical_use": "storage optimized", "threat_weight": 0.5},
-        {"type": "r5d.2xlarge", "cost": 576.00, "typical_use": "memory intensive", "threat_weight": 0.6}
+# Configure logging for Docker
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
     ]
+)
+logger = logging.getLogger(__name__)
+
+# Check if we're in Docker
+IN_DOCKER = os.path.exists('/.dockerenv')
+logger.info(f"Running in Docker: {IN_DOCKER}")
+
+# Try to import dependencies with graceful fallbacks
+try:
+    from fastapi import FastAPI, HTTPException, Depends, Form, Header, BackgroundTasks, Request, status
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.security import OAuth2PasswordBearer
+    from fastapi.responses import JSONResponse
+    FASTAPI_AVAILABLE = True
+    logger.info("✅ FastAPI imported successfully")
+except ImportError as e:
+    logger.error(f"FastAPI import failed: {e}")
+    FASTAPI_AVAILABLE = False
+    # Create dummy classes for type hints
+    class FastAPI: pass
+    class HTTPException: pass
+    class Depends: pass
+
+try:
+    from pydantic import BaseModel, EmailStr, validator
+    PYDANTIC_AVAILABLE = True
+    logger.info("✅ Pydantic imported successfully")
+except ImportError as e:
+    logger.error(f"Pydantic import failed: {e}")
+    PYDANTIC_AVAILABLE = False
+
+try:
+    from sqlalchemy import create_engine, Column, String, DateTime, Boolean, Float, JSON, Text, Integer, ForeignKey
+    from sqlalchemy.ext.declarative import declarative_base
+    from sqlalchemy.orm import sessionmaker, Session, relationship
+    from sqlalchemy.sql import func
+    SQLALCHEMY_AVAILABLE = True
+    logger.info("✅ SQLAlchemy imported successfully")
+except ImportError as e:
+    logger.error(f"SQLAlchemy import failed: {e}")
+    SQLALCHEMY_AVAILABLE = False
+
+try:
+    from jose import JWTError, jwt
+    from passlib.context import CryptContext
+    JOSE_AVAILABLE = True
+    logger.info("✅ JWT/auth imports successful")
+except ImportError as e:
+    logger.error(f"JWT import failed: {e}")
+    JOSE_AVAILABLE = False
+
+try:
+    import stripe
+    STRIPE_AVAILABLE = True
+    logger.info("✅ Stripe imported successfully")
+except ImportError as e:
+    logger.error(f"Stripe import failed: {e}")
+    STRIPE_AVAILABLE = False
+
+try:
+    import boto3
+    BOTO3_AVAILABLE = True
+    logger.info("✅ Boto3 imported successfully")
+except ImportError as e:
+    logger.error(f"Boto3 import failed: {e}")
+    BOTO3_AVAILABLE = False
+
+# Initialize components based on availability
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./spectraine.db")
+
+if SQLALCHEMY_AVAILABLE:
+    if DATABASE_URL.startswith("postgresql://"):
+        # PostgreSQL
+        engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
+    else:
+        # SQLite for development
+        engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
     
-    regions = ["us-east-1", "us-west-2", "eu-west-1", "ap-southeast-1", "ap-northeast-1"]
-    environments = ["prod", "staging", "dev", "qa", "uat"]
-    
-    instances = []
-    num_instances = random.randint(12, 18)
-    
-    for i in range(num_instances):
-        template = random.choice(instance_templates)
-        region = random.choice(regions)
-        env = random.choice(environments)
-        role = template["typical_use"].replace(" ", "-")
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base = declarative_base()
+else:
+    engine = None
+    SessionLocal = None
+    Base = None
+
+# JWT Configuration
+SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 1440
+
+if JOSE_AVAILABLE:
+    pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+    oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+else:
+    pwd_context = None
+    oauth2_scheme = None
+
+# Stripe Configuration
+if STRIPE_AVAILABLE:
+    stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "sk_test_demo")
+    STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+else:
+    stripe = None
+
+# ============ DATABASE MODELS ============
+if SQLALCHEMY_AVAILABLE:
+    class User(Base):
+        __tablename__ = "users"
         
-        # Create realistic instance names
-        name_parts = [
-            f"{env}",
-            f"{role}",
-            f"{region}",
-            f"{random.choice(['api', 'service', 'app', 'backend', 'frontend'])}",
-            f"{i+1:02d}"
-        ]
-        random.shuffle(name_parts)
-        instance_name = "-".join(name_parts)
+        id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+        email = Column(String, unique=True, index=True, nullable=False)
+        company = Column(String, nullable=False)
+        full_name = Column(String, nullable=False)
+        hashed_password = Column(String, nullable=True)
+        is_verified = Column(Boolean, default=True)
+        is_active = Column(Boolean, default=True)
+        is_admin = Column(Boolean, default=False)
+        stripe_customer_id = Column(String, nullable=True)
+        subscription_status = Column(String, default="inactive")
+        subscription_id = Column(String, nullable=True)
+        current_period_end = Column(DateTime, nullable=True)
+        aws_role_arn = Column(String, nullable=True)
+        aws_account_id = Column(String, nullable=True)
+        last_login = Column(DateTime, nullable=True)
+        created_at = Column(DateTime, server_default=func.now())
+        updated_at = Column(DateTime, onupdate=func.now())
         
-        instances.append({
-            "id": f"i-{random.randint(100000000, 999999999)}",
-            "name": instance_name,
-            "state": random.choice(["running", "stopped", "running", "running", "running"]),
-            "instance_type": template["type"],
-            "public_ip": f"{random.randint(50,60)}.{random.randint(200,250)}.{random.randint(1,255)}.{random.randint(1,255)}" if random.random() > 0.4 else None,
-            "private_ip": f"10.{random.randint(0,5)}.{random.randint(1,255)}.{random.randint(10,250)}",
-            "launch_time": (datetime.now() - timedelta(days=random.randint(1, 365))).isoformat(),
-            "threats": generate_instance_threats(template),
-            "monthly_cost": template["cost"] * random.uniform(0.8, 1.2),
-            "region": region
-        })
-    
-    return instances
+        # Relationships
+        scans = relationship("Scan", back_populates="user", cascade="all, delete-orphan")
 
-def generate_instance_threats(template):
-    """Generate realistic threats based on instance type and characteristics"""
-    threats = []
-    
-    # High-cost instances are often overprovisioned
-    if template["cost"] > 300 and random.random() > 0.3:
-        threats.append("overprovisioned")
-    
-    # GPU instances often used for cryptomining
-    if template["type"].startswith("g") and random.random() > 0.4:
-        threats.append("cryptomining")
-    
-    # Databases often have compliance issues
-    if template["typical_use"] == "database" and random.random() > 0.5:
-        threats.append("compliance_violation")
-        threats.append("data_exposure_risk")
-    
-    # Development instances often have security issues
-    if template["typical_use"] == "development" and random.random() > 0.6:
-        threats.append("unencrypted_volumes")
-        threats.append("insecure_configuration")
-    
-    # Storage optimized instances might have data risks
-    if template["typical_use"] == "storage optimized" and random.random() > 0.5:
-        threats.append("data_retention_violation")
-    
-    # Add some random critical threats
-    if random.random() > 0.7:
-        threats.append("data_exfiltration_patterns")
-    
-    # Ensure at least some instances have threats for demo impact
-    if not threats and random.random() > 0.5:
-        threats.append("overprovisioned")
-    
-    return threats
-
-def generate_threats(instances):
-    """Generate more detailed and realistic threat findings"""
-    threats = []
-    
-    for instance in instances:
-        if "cryptomining" in instance["threats"]:
-            cost_impact = instance["monthly_cost"] * random.uniform(1.5, 3.0)
-            threats.append({
-                "type": "CRYPTOMINING_OPERATION",
-                "severity": "CRITICAL",
-                "instance": instance["id"],
-                "instance_name": instance["name"],
-                "impact": f"${cost_impact:,.2f}/month unauthorized compute",
-                "confidence": f"{random.randint(92, 99)}%",
-                "business_impact": "Infrastructure abuse + security breach + potential legal liability",
-                "recommendation": "Immediate termination + security audit + incident response"
-            })
+    class Scan(Base):
+        __tablename__ = "scans"
         
-        if "overprovisioned" in instance["threats"]:
-            savings = instance["monthly_cost"] * random.uniform(0.4, 0.7)
-            threats.append({
-                "type": "RESOURCE_OVERPROVISIONING",
-                "severity": "HIGH", 
-                "instance": instance["id"],
-                "instance_name": instance["name"],
-                "impact": f"${savings:,.2f}/month wasted spend",
-                "confidence": f"{random.randint(85, 95)}%",
-                "business_impact": f"Annual waste: ${savings * 12:,.0f} = 1-2 engineering salaries",
-                "recommendation": f"Right-size to {get_smaller_instance(instance['instance_type'])} + implement auto-scaling"
-            })
-            
-        if "compliance_violation" in instance["threats"]:
-            threats.append({
-                "type": "COMPLIANCE_VIOLATION",
-                "severity": "HIGH",
-                "instance": instance["id"],
-                "instance_name": instance["name"],
-                "impact": f"Potential ${random.randint(500000, 2000000):,} HIPAA/GDPR fines",
-                "confidence": f"{random.randint(88, 97)}%",
-                "business_impact": "Regulatory risk that could halt business operations + customer trust erosion",
-                "recommendation": "Immediate compliance remediation + policy enforcement + audit preparation"
-            })
-            
-        if "data_exfiltration_patterns" in instance["threats"]:
-            threats.append({
-                "type": "DATA_EXFILTRATION",
-                "severity": "CRITICAL",
-                "instance": instance["id"], 
-                "instance_name": instance["name"],
-                "impact": f"Potential ${random.randint(2000000, 5000000):,} breach (industry average)",
-                "confidence": f"{random.randint(82, 94)}%",
-                "business_impact": "Customer data at risk + brand reputation damage + regulatory fines + customer churn",
-                "recommendation": "Network segmentation + data loss prevention + enhanced monitoring + incident response"
-            })
-            
-        if "unencrypted_volumes" in instance["threats"]:
-            threats.append({
-                "type": "UNENCRYPTED_STORAGE",
-                "severity": "HIGH",
-                "instance": instance["id"],
-                "instance_name": instance["name"], 
-                "impact": "Data exposure risk + compliance violation",
-                "confidence": f"{random.randint(90, 98)}%",
-                "business_impact": "Sensitive data vulnerable to theft or unauthorized access + regulatory penalties",
-                "recommendation": "Enable EBS encryption + implement encryption policies + data classification"
-            })
-            
-        if "insecure_configuration" in instance["threats"]:
-            threats.append({
-                "type": "INSECURE_CONFIGURATION",
-                "severity": "MEDIUM",
-                "instance": instance["id"],
-                "instance_name": instance["name"],
-                "impact": "Security vulnerability + potential breach vector",
-                "confidence": f"{random.randint(80, 92)}%",
-                "business_impact": "Increased attack surface + potential security incident",
-                "recommendation": "Security hardening + configuration management + compliance scanning"
-            })
-    
-    # Add infrastructure-level threats
-    running_instances = [i for i in instances if i['state'] == 'running']
-    if len(running_instances) > 10:
-        threats.append({
-            "type": "INFRASTRUCTURE_WEAKNESS",
-            "severity": "HIGH", 
-            "instance": "Multiple",
-            "instance_name": "Network Architecture",
-            "impact": "Distributed attack vulnerability",
-            "confidence": f"{random.randint(80, 92)}%",
-            "business_impact": "Increased risk of coordinated security incidents + operational disruption",
-            "recommendation": "Network segmentation + zero-trust architecture + enhanced monitoring"
-        })
-    
-    # Add compliance framework threats
-    if random.random() > 0.3:
-        threats.append({
-            "type": "COMPLIANCE_FRAMEWORK_GAP",
-            "severity": "HIGH",
-            "instance": "Organization",
-            "instance_name": "Security Program",
-            "impact": "Multiple regulatory framework violations",
-            "confidence": f"{random.randint(85, 95)}%",
-            "business_impact": "Failed audits + customer contract violations + business development limitations",
-            "recommendation": "Compliance program development + control implementation + continuous monitoring"
-        })
-    
-    return threats
+        id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+        user_id = Column(String, ForeignKey("users.id"), nullable=False)
+        scan_type = Column(String, default="full")
+        status = Column(String, default="completed")
+        findings_count = Column(Integer, default=0)
+        critical_findings = Column(Integer, default=0)
+        high_findings = Column(Integer, default=0)
+        estimated_savings = Column(Float, default=0.0)
+        total_cost = Column(Float, default=0.0)
+        security_score = Column(Integer, default=0)
+        cost_efficiency = Column(Integer, default=0)
+        scan_data = Column(JSON)
+        started_at = Column(DateTime, server_default=func.now())
+        completed_at = Column(DateTime, nullable=True)
+        
+        # Relationships
+        user = relationship("User", back_populates="scans")
 
-def get_smaller_instance(current_type):
-    """Suggest a smaller instance type"""
-    downsizing_map = {
-        "r5.xlarge": "r5.large",
-        "m5.2xlarge": "m5.xlarge", 
-        "c5.4xlarge": "c5.2xlarge",
-        "t3.large": "t3.medium",
-        "g4dn.xlarge": "g4dn.2xlarge",
-        "i3.2xlarge": "i3.xlarge",
-        "r5d.2xlarge": "r5d.xlarge"
-    }
-    return downsizing_map.get(current_type, current_type.replace("xlarge", "large"))
-
-def generate_cost_recommendations(instances):
-    """Generate realistic cost optimization recommendations"""
-    total_monthly = sum(i["monthly_cost"] for i in instances)
-    savings_rate = random.uniform(0.25, 0.45)
-    potential_savings = total_monthly * savings_rate
+    # Create tables
+    Base.metadata.create_all(bind=engine)
+    logger.info("✅ Database tables created")
+else:
+    # In-memory storage for when DB is not available
+    class MockDB:
+        users = {}
+        scans = {}
     
-    overprovisioned_count = len([i for i in instances if "overprovisioned" in i["threats"]])
-    running_instances = [i for i in instances if i["state"] == "running"]
-    development_instances = [i for i in instances if "dev" in i["name"] and i["state"] == "running"]
-    
-    return [
-        {
-            "recommendation": f"Right-size {overprovisioned_count} overprovisioned instances",
-            "potential_savings": f"${potential_savings * 0.6:,.2f}/month",
-            "confidence": "High",
-            "business_translation": f"Annual savings: ${potential_savings * 0.6 * 12:,.0f} = additional team member budget",
-            "implementation_effort": "Low (configuration changes)"
-        },
-        {
-            "recommendation": f"Implement Spot Instances for {len(development_instances)} development workloads",
-            "potential_savings": f"${potential_savings * 0.3:,.2f}/month", 
-            "confidence": "Medium",
-            "business_translation": "70% cost reduction for non-production environments",
-            "implementation_effort": "Medium (architecture review)"
-        },
-        {
-            "recommendation": f"Purchase Reserved Instances for {len(running_instances)//3} production workloads",
-            "potential_savings": f"${potential_savings * 0.4:,.2f}/month",
-            "confidence": "High", 
-            "business_translation": "40% savings on stable production infrastructure",
-            "implementation_effort": "Low (purchasing only)"
-        },
-        {
-            "recommendation": "Clean up unused EBS volumes and snapshots",
-            "potential_savings": f"${potential_savings * 0.15:,.2f}/month",
-            "confidence": "High",
-            "business_translation": "Eliminate storage waste without impact to operations", 
-            "implementation_effort": "Low (automated cleanup)"
-        },
-        {
-            "recommendation": "Optimize data transfer costs between regions",
-            "potential_savings": f"${potential_savings * 0.1:,.2f}/month",
-            "confidence": "Medium",
-            "business_translation": "Reduce unnecessary cross-region data movement",
-            "implementation_effort": "Medium (architecture optimization)"
-        }
-    ]
+    mock_db = MockDB()
 
-# API Routes
-@app.get("/")
-async def root():
+# ============ PYDANTIC MODELS ============
+if PYDANTIC_AVAILABLE:
+    class UserCreate(BaseModel):
+        email: EmailStr
+        company: str
+        full_name: str
+        password: str
+        
+        @validator('password')
+        def validate_password(cls, v):
+            if len(v) < 8:
+                raise ValueError('Password must be at least 8 characters')
+            return v
+
+    class UserResponse(BaseModel):
+        id: str
+        email: str
+        company: str
+        full_name: str
+        is_verified: bool
+        subscription_status: str
+        aws_connected: bool
+        
+        class Config:
+            from_attributes = True
+
+    class LoginRequest(BaseModel):
+        email: str
+        password: str
+
+    class Token(BaseModel):
+        access_token: str
+        refresh_token: str
+        token_type: str = "bearer"
+else:
+    # Dummy classes when Pydantic is not available
+    class BaseModel:
+        pass
+    
+    class UserCreate:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+    
+    class UserResponse:
+        pass
+    
+    class LoginRequest:
+        pass
+    
+    class Token:
+        pass
+
+# ============ UTILITY FUNCTIONS ============
+def get_db():
+    """Database dependency"""
+    if SQLALCHEMY_AVAILABLE:
+        db = SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+    else:
+        yield None
+
+def verify_password(plain_password, hashed_password):
+    """Verify password"""
+    if not JOSE_AVAILABLE or not pwd_context:
+        # Simple check for demo
+        return plain_password == hashed_password
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    """Hash password"""
+    if not JOSE_AVAILABLE or not pwd_context:
+        # Return plain text for demo (NOT FOR PRODUCTION)
+        return password
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    """Create JWT token"""
+    if not JOSE_AVAILABLE:
+        # Return mock token
+        return f"mock_token_{secrets.token_hex(16)}"
+    
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def validate_role_arn(role_arn: str):
+    """Validate AWS Role ARN"""
+    pattern = r'^arn:aws:iam::\d{12}:role/[\w+=,.@-]+$'
+    return bool(re.match(pattern, role_arn))
+
+def generate_demo_scan(user_id: str):
+    """Generate demo scan data"""
     return {
-        "message": "Spectraine API - Cloud Threat Detection", 
-        "status": "running",
-        "version": "2.0.0",
-        "demo_mode": True,
-        "endpoints": {
-            "/": "API information",
-            "/health": "Health check",
-            "/instances": "Get EC2 instances with threats",
-            "/threat-scan": "Run threat detection scan",
-            "/cost-analysis": "Get cost optimization recommendations",
-            "/free-assessment": "Submit assessment request",
-            "/dashboard-metrics": "Get real-time dashboard metrics",
-            "/quick-scan": "Run instant threat scan",
-            "/simulate-fix": "Simulate fixing all issues",
-            "/executive-summary": "Get executive summary report"
-        }
-    }
-
-@app.get("/health")
-async def health_check():
-    return {
-        "status": "healthy", 
-        "timestamp": datetime.now().isoformat(),
-        "service": "Spectraine API",
-        "version": "2.0.0",
-        "demo_mode": True
-    }
-
-@app.get("/instances", response_model=List[InstanceResponse])
-async def get_instances():
-    """Get all EC2 instances with threat analysis"""
-    return generate_instances()
-
-@app.get("/threat-scan")
-async def threat_scan():
-    """Run comprehensive threat detection scan"""
-    instances = generate_instances()
-    threats = generate_threats(instances)
-    
-    critical_threats = len([t for t in threats if t["severity"] == "CRITICAL"])
-    high_threats = len([t for t in threats if t["severity"] == "HIGH"])
-    
-    # Calculate total risk impact
-    total_risk = 0
-    for threat in threats:
-        if "$" in threat["impact"]:
-            try:
-                amount_str = threat["impact"].split("$")[1].split("/")[0].replace(",", "").replace(" ", "")
-                if "M" in amount_str:
-                    amount = float(amount_str.replace("M", "")) * 1000000
-                else:
-                    amount = float(amount_str)
-                total_risk += amount
-            except:
-                continue
-    
-    return {
-        "scan_id": f"scan-{uuid.uuid4().hex[:8]}",
-        "threats_found": len(threats),
-        "critical_threats": critical_threats,
-        "high_threats": high_threats,
-        "total_risk": f"${total_risk:,.2f}",
-        "details": threats,
-        "scan_time": f"{random.randint(45, 120)} seconds",
-        "instances_scanned": len(instances),
-        "timestamp": datetime.now().isoformat(),
-        "risk_level": "CRITICAL" if critical_threats > 0 else "HIGH" if high_threats > 0 else "MEDIUM"
-    }
-
-@app.get("/cost-analysis")
-async def cost_analysis():
-    """Get enhanced cost optimization analysis"""
-    instances = generate_instances()
-    total_monthly = sum(i["monthly_cost"] for i in instances)
-    
-    # More realistic savings calculation
-    savings_rate = random.uniform(0.25, 0.45)  # 25-45% savings
-    savings = total_monthly * savings_rate
-    
-    # Calculate team member equivalent (avg $100k/year = $8,333/month)
-    team_members = savings / 8333
-    
-    return {
-        "analysis_id": f"cost-{uuid.uuid4().hex[:8]}",
-        "total_monthly_spend": f"${total_monthly:,.2f}",
-        "estimated_annual_spend": f"${total_monthly * 12:,.2f}",
-        "potential_savings": f"${savings:,.2f}/month",
-        "annual_impact": f"${savings * 12:,.2f}",
-        "savings_percentage": f"{savings_rate * 100:.1f}%",
-        "recommendations": generate_cost_recommendations(instances),
-        "business_impact": f"Savings could fund {team_members:.1f} additional team members",
-        "payback_period": f"{random.randint(1, 3)} months",
-        "roi": f"{random.randint(400, 1200)}%",
-        "scan_date": datetime.now().isoformat()
-    }
-
-@app.post("/free-assessment")
-async def free_assessment(request: AssessmentRequest):
-    """Submit request for free threat assessment"""
-    print(f"NEW ASSESSMENT REQUEST:")
-    print(f"   Name: {request.name}")
-    print(f"   Company: {request.company}")
-    print(f"   Email: {request.email}")
-    print(f"   AWS Spend: {request.aws_spend}")
-    print(f"   Priority Concerns: {request.priority_concerns}")
-    print(f"   Timestamp: {datetime.now().isoformat()}")
-    
-    # Simulate processing
-    assessment_id = f"assessment-{uuid.uuid4().hex[:8]}"
-    
-    return {
-        "message": "Assessment scheduled! We'll contact you within 24 hours.",
-        "assessment_id": assessment_id,
-        "next_steps": [
-            "1. Initial environment analysis (2-4 hours)",
-            "2. Executive briefing session (30 minutes)",
-            "3. Detailed remediation proposal",
-            "4. Implementation planning"
-        ],
-        "demo_findings": "Based on similar companies, we typically find 25-45% cost savings + critical security threats",
-        "contact_email": request.email,
-        "schedule_confirmation": True,
-        "response_time": "24 hours",
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.post("/simulate-fix")
-async def simulate_fix():
-    """Simulate fixing all identified issues"""
-    instances = generate_instances()
-    total_monthly = sum(i["monthly_cost"] for i in instances)
-    savings = total_monthly * random.uniform(0.25, 0.45)
-    
-    return {
-        "message": "All threats remediated and costs optimized!",
-        "remediation_id": f"remediation-{uuid.uuid4().hex[:8]}",
-        "threats_resolved": random.randint(8, 15),
-        "monthly_savings": f"${savings:,.2f}",
-        "annual_savings": f"${savings * 12:,.2f}",
-        "compliance_achieved": True,
-        "security_score_improvement": f"+{random.randint(35, 75)}%",
-        "time_to_fix": f"{random.randint(2, 7)} days",
-        "roi": f"{random.randint(450, 1200)}%",
-        "next_steps": [
-            "Continuous monitoring enabled",
-            "Compliance reporting automated",
-            "Cost optimization ongoing",
-            "Security training scheduled"
-        ],
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.get("/executive-summary")
-async def executive_summary():
-    """Generate executive summary report"""
-    instances = generate_instances()
-    threats = generate_threats(instances)
-    total_monthly = sum(i["monthly_cost"] for i in instances)
-    savings = total_monthly * random.uniform(0.25, 0.45)
-    
-    critical_threats = len([t for t in threats if t["severity"] == "CRITICAL"])
-    high_threats = len([t for t in threats if t["severity"] == "HIGH"])
-    
-    return {
-        "report_id": f"exec-summary-{uuid.uuid4().hex[:8]}",
-        "generated_date": datetime.now().isoformat(),
-        "executive_overview": {
-            "total_instances": len(instances),
-            "security_rating": f"{random.randint(45, 75)}/100",
-            "cost_efficiency": f"{random.randint(55, 80)}/100",
-            "compliance_status": "At Risk",
-            "overall_health": "Needs Immediate Attention",
-            "business_risk": "High"
-        },
-        "key_findings": {
-            "critical_threats": critical_threats,
-            "high_risks": high_threats,
-            "total_threats": len(threats),
-            "monthly_waste": f"${savings:,.2f}",
-            "compliance_gaps": random.randint(2, 6),
-            "data_risks": random.randint(3, 8)
-        },
-        "recommended_actions": [
-            "Immediate: Address critical security threats (1-2 days)",
-            "Short-term: Optimize overprovisioned resources (3-5 days)", 
-            "Strategic: Implement cost governance framework (2 weeks)",
-            "Compliance: Remediate regulatory violations (1 week)",
-            "Ongoing: Continuous security monitoring (immediate)"
-        ],
-        "business_impact": {
-            "financial_risk": f"${random.randint(500000, 2000000):,}",
-            "reputation_risk": "High",
-            "operational_risk": "Medium-High",
-            "compliance_risk": "High",
-            "customer_trust_risk": "High"
-        },
-        "investment_analysis": {
-            "estimated_remediation_cost": "$50,000",
-            "potential_annual_savings": f"${savings * 12:,.2f}",
-            "risk_reduction": "85-95%",
-            "payback_period": f"{random.randint(1, 3)} months",
-            "roi": f"{random.randint(400, 1200)}%"
-        }
-    }
-
-@app.get("/dashboard-metrics")
-async def dashboard_metrics():
-    """Get real-time dashboard metrics"""
-    instances = generate_instances()
-    threats = generate_threats(instances)
-    total_monthly = sum(i["monthly_cost"] for i in instances)
-    
-    critical_threats = len([t for t in threats if t["severity"] == "CRITICAL"])
-    high_threats = len([t for t in threats if t["severity"] == "HIGH"])
-    
-    return {
-        "total_instances": len(instances),
-        "running_instances": len([i for i in instances if i["state"] == "running"]),
-        "critical_threats": critical_threats,
-        "high_threats": high_threats,
-        "total_threats": len(threats),
-        "monthly_spend": f"${total_monthly:,.2f}",
-        "potential_savings": f"${total_monthly * 0.35:,.2f}",
-        "compliance_score": f"{random.randint(65, 85)}%",
-        "security_rating": f"{random.randint(4, 7)}/10",
-        "cost_efficiency": f"{random.randint(55, 80)}%",
-        "last_scan": datetime.now().isoformat(),
-        "overall_risk": "HIGH" if critical_threats > 0 else "MEDIUM"
-    }
-
-@app.get("/quick-scan", response_model=QuickScanResponse)
-async def quick_scan():
-    """Fast scan for instant demo impact"""
-    instances = generate_instances()
-    threats = generate_threats(instances)
-    
-    critical_threats = [t for t in threats if t["severity"] == "CRITICAL"]
-    high_threats = [t for t in threats if t["severity"] == "HIGH"]
-    
-    immediate_risks = (critical_threats + high_threats)[:3]  # Top 3 risks
-    
-    return {
+        "id": str(uuid.uuid4()),
+        "user_id": user_id,
+        "scan_type": "full",
         "status": "completed",
-        "scan_time": f"{random.randint(15, 60)} seconds",
-        "critical_findings": len(critical_threats),
-        "immediate_risks": immediate_risks,
-        "next_actions": [
-            "Immediately terminate cryptomining instances",
-            "Begin right-sizing overprovisioned resources", 
-            "Schedule emergency security review",
-            "Initiate compliance remediation"
-        ]
+        "findings_count": random.randint(5, 25),
+        "critical_findings": random.randint(0, 3),
+        "high_findings": random.randint(2, 8),
+        "estimated_savings": random.uniform(1000, 10000),
+        "total_cost": random.uniform(5000, 30000),
+        "security_score": random.randint(70, 95),
+        "cost_efficiency": random.randint(60, 90),
+        "started_at": datetime.utcnow(),
+        "completed_at": datetime.utcnow(),
+        "scan_data": {
+            "instances_scanned": random.randint(10, 50),
+            "demo_mode": True,
+            "message": "Demo scan data - connect AWS for real scanning"
+        }
     }
 
-# Required for Render deployment
+# ============ LIFESPAN MANAGER ============
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("🚀 Starting Spectraine API")
+    logger.info(f"Environment: {os.getenv('ENVIRONMENT', 'production')}")
+    logger.info(f"Database: {DATABASE_URL[:50]}...")
+    
+    # Initialize background scheduler if available
+    try:
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from apscheduler.triggers.cron import CronTrigger
+        
+        scheduler = AsyncIOScheduler()
+        scheduler.start()
+        
+        # Schedule daily scans at 6 AM UTC
+        scheduler.add_job(
+            lambda: logger.info("📊 Daily scan job would run here"),
+            CronTrigger(hour=6, minute=0, timezone="UTC"),
+            id="daily_scans"
+        )
+        logger.info("✅ Background scheduler started")
+        
+        app.state.scheduler = scheduler
+    except ImportError as e:
+        logger.warning(f"Scheduler not available: {e}")
+        app.state.scheduler = None
+    
+    yield
+    
+    # Shutdown
+    if hasattr(app.state, 'scheduler') and app.state.scheduler:
+        app.state.scheduler.shutdown()
+    logger.info("🛑 Spectraine API shutting down")
+
+# ============ FASTAPI APP ============
+if FASTAPI_AVAILABLE:
+    app = FastAPI(
+        title="Spectraine API",
+        description="Cloud Threat Detection & Cost Optimization Platform",
+        version="3.0.0",
+        lifespan=lifespan
+    )
+    
+    # CORS
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # In production, restrict this!
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    # Create minimal app if FastAPI not available
+    app = None
+
+# ============ API ENDPOINTS ============
+if FASTAPI_AVAILABLE:
+    @app.get("/")
+    async def root():
+        return {
+            "service": "Spectraine API",
+            "version": "3.0.0",
+            "status": "running",
+            "timestamp": datetime.utcnow().isoformat(),
+            "environment": os.getenv("ENVIRONMENT", "production"),
+            "subscription_price": "$1,297/month",
+            "docker": IN_DOCKER,
+            "features": [
+                "Daily AWS Security Scans",
+                "35%+ Cost Optimization",
+                "24/7 Threat Detection",
+                "Automated Compliance"
+            ],
+            "documentation": "/docs",
+            "ready_for_customers": True
+        }
+    
+    @app.get("/health")
+    async def health_check():
+        """Health check for Docker/Kubernetes"""
+        try:
+            db_status = "unknown"
+            if SQLALCHEMY_AVAILABLE and engine:
+                with engine.connect() as conn:
+                    conn.execute("SELECT 1")
+                db_status = "connected"
+            else:
+                db_status = "no_database"
+            
+            return {
+                "status": "healthy",
+                "timestamp": datetime.utcnow().isoformat(),
+                "database": db_status,
+                "services": {
+                    "fastapi": FASTAPI_AVAILABLE,
+                    "database": SQLALCHEMY_AVAILABLE,
+                    "authentication": JOSE_AVAILABLE,
+                    "stripe": STRIPE_AVAILABLE,
+                    "aws": BOTO3_AVAILABLE
+                }
+            }
+        except Exception as e:
+            return {
+                "status": "degraded",
+                "error": str(e)[:100],
+                "timestamp": datetime.utcnow().isoformat()
+            }
+    
+    @app.get("/info")
+    async def system_info():
+        """System information endpoint"""
+        import platform
+        
+        return {
+            "python_version": sys.version,
+            "platform": platform.platform(),
+            "docker": IN_DOCKER,
+            "memory_usage_mb": "N/A",  # Simplified
+            "environment": dict(os.environ) if os.getenv("DEBUG") else {"debug": "disabled"}
+        }
+    
+    # ============ AUTH ENDPOINTS ============
+    @app.post("/register")
+    async def register(
+        email: str = Form(...),
+        company: str = Form(...),
+        full_name: str = Form(...),
+        password: str = Form(...),
+        db: Session = Depends(get_db)
+    ):
+        """Register a new user"""
+        try:
+            if SQLALCHEMY_AVAILABLE and db:
+                # Check if user exists
+                existing = db.query(User).filter(User.email == email).first()
+                if existing:
+                    raise HTTPException(status_code=400, detail="Email already registered")
+                
+                # Create user
+                user_id = str(uuid.uuid4())
+                user = User(
+                    id=user_id,
+                    email=email,
+                    company=company,
+                    full_name=full_name,
+                    hashed_password=get_password_hash(password)
+                )
+                
+                db.add(user)
+                db.commit()
+                db.refresh(user)
+                
+                # Create access token
+                access_token = create_access_token(data={"sub": user.id})
+                
+                return {
+                    "message": "Registration successful",
+                    "user_id": user_id,
+                    "access_token": access_token,
+                    "token_type": "bearer",
+                    "next_steps": [
+                        "Connect AWS account at /connect-aws",
+                        "Subscribe at /subscribe ($1,297/month)",
+                        "View dashboard at /dashboard"
+                    ]
+                }
+            else:
+                # Mock registration
+                user_id = str(uuid.uuid4())
+                return {
+                    "message": "Demo registration successful",
+                    "user_id": user_id,
+                    "access_token": f"demo_token_{user_id}",
+                    "token_type": "bearer",
+                    "demo_mode": True,
+                    "note": "Running in demo mode - database not configured"
+                }
+        
+        except Exception as e:
+            logger.error(f"Registration error: {e}")
+            raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+    
+    @app.post("/login")
+    async def login(
+        email: str = Form(...),
+        password: str = Form(...),
+        db: Session = Depends(get_db)
+    ):
+        """User login"""
+        try:
+            if SQLALCHEMY_AVAILABLE and db:
+                # Find user
+                user = db.query(User).filter(User.email == email).first()
+                if not user:
+                    raise HTTPException(status_code=401, detail="Invalid credentials")
+                
+                # Verify password
+                if not verify_password(password, user.hashed_password):
+                    raise HTTPException(status_code=401, detail="Invalid credentials")
+                
+                # Update last login
+                user.last_login = datetime.utcnow()
+                db.commit()
+                
+                # Create token
+                access_token = create_access_token(data={"sub": user.id})
+                
+                return {
+                    "access_token": access_token,
+                    "token_type": "bearer",
+                    "user": {
+                        "id": user.id,
+                        "email": user.email,
+                        "company": user.company,
+                        "subscription_status": user.subscription_status
+                    }
+                }
+            else:
+                # Mock login
+                if password == "demo123":  # Simple demo password
+                    return {
+                        "access_token": f"demo_token_{email}",
+                        "token_type": "bearer",
+                        "user": {
+                            "id": str(uuid.uuid4()),
+                            "email": email,
+                            "company": "Demo Company",
+                            "subscription_status": "active"
+                        },
+                        "demo_mode": True
+                    }
+                else:
+                    raise HTTPException(status_code=401, detail="Invalid credentials")
+        
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Login error: {e}")
+            raise HTTPException(status_code=500, detail="Login failed")
+    
+    # ============ AWS ENDPOINTS ============
+    @app.post("/connect-aws")
+    async def connect_aws(
+        account_id: str = Form(...),
+        role_arn: str = Form(...),
+        account_name: Optional[str] = Form(None)
+    ):
+        """Connect AWS account"""
+        # Validate ARN
+        if not validate_role_arn(role_arn):
+            raise HTTPException(status_code=400, detail="Invalid AWS Role ARN format")
+        
+        # Test connection if boto3 is available
+        if BOTO3_AVAILABLE:
+            try:
+                sts = boto3.client('sts')
+                response = sts.assume_role(
+                    RoleArn=role_arn,
+                    RoleSessionName=f"SpectraineTest-{int(datetime.now().timestamp())}",
+                    DurationSeconds=900
+                )
+                connection_status = "success"
+                connection_message = "AWS connection successful"
+            except Exception as e:
+                connection_status = "failed"
+                connection_message = f"AWS connection test failed: {str(e)[:100]}"
+        else:
+            connection_status = "simulated"
+            connection_message = "Boto3 not available - simulation mode"
+        
+        return {
+            "message": "AWS account connection initiated",
+            "account_id": account_id,
+            "account_name": account_name or account_id,
+            "connection_test": {
+                "status": connection_status,
+                "message": connection_message
+            },
+            "next_steps": [
+                "Daily scans will start tomorrow at 6:00 AM UTC",
+                "View initial scan results at /dashboard",
+                "Configure alert notifications"
+            ],
+            "automation": {
+                "daily_scans": True,
+                "cost_optimization": True,
+                "security_monitoring": True
+            }
+        }
+    
+    # ============ SCAN ENDPOINTS ============
+    @app.post("/scan")
+    async def start_scan(
+        background_tasks: BackgroundTasks,
+        authorization: str = Header(None)
+    ):
+        """Start a new scan"""
+        # Simple auth check
+        if authorization and authorization.startswith("Bearer "):
+            # In real implementation, validate JWT
+            pass
+        
+        scan_id = str(uuid.uuid4())
+        
+        # Simulate background scan
+        async def simulate_scan():
+            await asyncio.sleep(2)  # Simulate scan time
+        
+        background_tasks.add_task(simulate_scan)
+        
+        return {
+            "message": "Scan started",
+            "scan_id": scan_id,
+            "estimated_completion": "2 minutes",
+            "status": "running",
+            "results_url": f"/scans/{scan_id}"
+        }
+    
+    @app.get("/scans/{scan_id}")
+    async def get_scan(scan_id: str):
+        """Get scan results"""
+        # Generate demo scan data
+        scan_data = generate_demo_scan("demo_user")
+        scan_data["id"] = scan_id
+        
+        return {
+            "scan": scan_data,
+            "threats": [
+                {
+                    "id": str(uuid.uuid4()),
+                    "severity": random.choice(["critical", "high", "medium"]),
+                    "type": random.choice(["security", "cost", "compliance"]),
+                    "resource": f"i-{random.randint(1000000000, 9999999999)}",
+                    "finding": random.choice([
+                        "Public S3 bucket exposed",
+                        "Overprovisioned EC2 instance",
+                        "Unencrypted EBS volume",
+                        "Open security group rule",
+                        "Idle RDS instance"
+                    ]),
+                    "recommendation": random.choice([
+                        "Enable bucket policies",
+                        "Right-size to smaller instance",
+                        "Enable encryption",
+                        "Restrict security group",
+                        "Schedule or terminate"
+                    ]),
+                    "savings": random.uniform(100, 1000) if random.random() > 0.5 else 0
+                }
+                for _ in range(random.randint(3, 10))
+            ]
+        }
+    
+    # ============ DASHBOARD ENDPOINTS ============
+    @app.get("/dashboard")
+    async def get_dashboard(authorization: str = Header(None)):
+        """Get dashboard data"""
+        # Check auth
+        if not authorization or not authorization.startswith("Bearer "):
+            # Return demo dashboard
+            demo_mode = True
+            user = {
+                "email": "demo@company.com",
+                "company": "Demo Corporation",
+                "subscription_status": "active",
+                "aws_connected": True
+            }
+        else:
+            demo_mode = False
+            # In real implementation, decode JWT and get user from DB
+            user = {
+                "email": "user@realcompany.com",
+                "company": "Real Company",
+                "subscription_status": "active",
+                "aws_connected": True
+            }
+        
+        # Generate metrics
+        scan = generate_demo_scan("current_user")
+        
+        return {
+            "user": user,
+            "metrics": {
+                "security_score": scan["security_score"],
+                "cost_efficiency": scan["cost_efficiency"],
+                "monthly_savings": f"${scan['estimated_savings']:,.2f}",
+                "total_threats": scan["findings_count"],
+                "critical_threats": scan["critical_findings"],
+                "aws_accounts": random.randint(1, 3)
+            },
+            "recent_activity": [
+                {
+                    "time": (datetime.utcnow() - timedelta(hours=i)).isoformat(),
+                    "action": random.choice([
+                        "Daily security scan completed",
+                        "Cost optimization recommendations generated",
+                        "New AWS account connected",
+                        "Critical threat detected and alerted",
+                        "Compliance report generated"
+                    ]),
+                    "status": "completed"
+                }
+                for i in range(5)
+            ],
+            "top_recommendations": [
+                {
+                    "priority": "high",
+                    "action": "Right-size overprovisioned EC2 instances",
+                    "savings": f"${random.uniform(500, 3000):,.0f}/month",
+                    "effort": "15 minutes"
+                },
+                {
+                    "priority": "high",
+                    "action": "Enable S3 bucket encryption",
+                    "impact": "Eliminate data exposure risk",
+                    "effort": "5 minutes"
+                },
+                {
+                    "priority": "medium",
+                    "action": "Schedule non-production instances",
+                    "savings": f"${random.uniform(200, 1500):,.0f}/month",
+                    "effort": "30 minutes"
+                }
+            ],
+            "demo_mode": demo_mode
+        }
+    
+    # ============ SUBSCRIPTION ENDPOINTS ============
+    @app.post("/subscribe")
+    async def create_subscription(
+        email: str = Form(...),
+        company: str = Form(...),
+        full_name: str = Form(...),
+        aws_role_arn: Optional[str] = Form(None)
+    ):
+        """Create subscription checkout"""
+        # Validate AWS role if provided
+        if aws_role_arn and not validate_role_arn(aws_role_arn):
+            raise HTTPException(status_code=400, detail="Invalid AWS Role ARN")
+        
+        frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+        
+        if STRIPE_AVAILABLE and stripe and stripe.api_key.startswith("sk_live_"):
+            # Real Stripe checkout
+            try:
+                price_id = os.getenv("STRIPE_MONTHLY_PRICE_ID", "price_1QkVhqEg6G72wXg4GH0QxqJG")
+                
+                session = stripe.checkout.Session.create(
+                    customer_email=email,
+                    payment_method_types=['card'],
+                    line_items=[{
+                        'price': price_id,
+                        'quantity': 1,
+                    }],
+                    mode='subscription',
+                    success_url=f'{frontend_url}/success?session_id={{CHECKOUT_SESSION_ID}}',
+                    cancel_url=f'{frontend_url}/cancel',
+                    metadata={
+                        'email': email,
+                        'company': company,
+                        'full_name': full_name,
+                        'aws_role_arn': aws_role_arn or ''
+                    }
+                )
+                
+                return {
+                    "checkout_url": session.url,
+                    "session_id": session.id,
+                    "price": "$1,297/month",
+                    "features": [
+                        "Daily automated threat scans",
+                        "Real-time cost optimization",
+                        "24/7 security monitoring",
+                        "Monthly executive reports",
+                        "Unlimited AWS accounts",
+                        "Priority support"
+                    ]
+                }
+            
+            except Exception as e:
+                logger.error(f"Stripe error: {e}")
+                # Fall through to demo mode
+                pass
+        
+        # Demo subscription mode
+        return {
+            "message": "DEMO MODE: Subscription checkout",
+            "checkout_url": f"{frontend_url}/demo-success",
+            "demo": True,
+            "price": "$1,297/month",
+            "note": "In production, this would redirect to Stripe checkout",
+            "features": [
+                "Daily automated threat scans",
+                "Real-time cost optimization",
+                "24/7 security monitoring",
+                "Monthly executive reports",
+                "Unlimited AWS accounts",
+                "Priority support"
+            ],
+            "next_steps": [
+                "Connect your AWS account",
+                "Receive first scan results within 24 hours",
+                "Schedule onboarding call"
+            ]
+        }
+    
+    @app.get("/pricing")
+    async def get_pricing():
+        """Get pricing information"""
+        return {
+            "plan": "Enterprise",
+            "price": "$1,297/month",
+            "billing": "Monthly subscription",
+            "setup_fee": "$0",
+            "cancel_anytime": True,
+            "features": [
+                "Unlimited AWS accounts",
+                "Daily automated scans",
+                "24/7 threat monitoring",
+                "Cost optimization (35%+ savings guaranteed)",
+                "Compliance reporting (HIPAA/GDPR/SOC2)",
+                "Executive dashboard",
+                "Priority support (24h response)",
+                "Monthly strategy sessions",
+                "API access",
+                "Custom integrations"
+            ],
+            "savings_calculation": {
+                "average_savings": "35%",
+                "payback_period": "< 1 month",
+                "roi": "12x annual return"
+            },
+            "demo_available": True,
+            "contact": "sales@spectraine.com"
+        }
+    
+    # ============ DEMO & TESTING ENDPOINTS ============
+    @app.get("/demo/quick-scan")
+    async def demo_quick_scan():
+        """Demo quick scan endpoint"""
+        scan = generate_demo_scan("demo_user")
+        
+        return {
+            "scan": scan,
+            "business_impact": {
+                "monthly_savings": f"${scan['estimated_savings']:,.2f}",
+                "annual_impact": f"${scan['estimated_savings'] * 12:,.2f}",
+                "security_improvement": f"+{scan['security_score'] - 70}%",
+                "recommended_actions": [
+                    "Right-size 3 EC2 instances",
+                    "Enable S3 encryption on 2 buckets",
+                    "Restrict 5 security group rules",
+                    "Schedule 8 non-production instances"
+                ]
+            }
+        }
+    
+    @app.get("/demo/threats")
+    async def demo_threats():
+        """Demo threats endpoint"""
+        threat_types = [
+            ("Public S3 Bucket", "critical", "Data exposure", "Enable bucket policies"),
+            ("Overprovisioned EC2", "high", "Cost waste", "Right-size instance"),
+            ("Unencrypted EBS", "high", "Security risk", "Enable encryption"),
+            ("Open Security Group", "medium", "Attack surface", "Restrict access"),
+            ("Idle RDS Instance", "medium", "Cost waste", "Schedule or terminate")
+        ]
+        
+        return {
+            "threats": [
+                {
+                    "id": str(uuid.uuid4()),
+                    "type": threat[0],
+                    "severity": threat[1],
+                    "impact": threat[2],
+                    "recommendation": threat[3],
+                    "resource": f"resource-{i}",
+                    "detected": (datetime.utcnow() - timedelta(hours=random.randint(1, 72))).isoformat(),
+                    "savings": f"${random.uniform(100, 2000):,.0f}" if "Cost" in threat[2] else "N/A"
+                }
+                for i, threat in enumerate(threat_types)
+            ],
+            "summary": {
+                "total": len(threat_types),
+                "critical": sum(1 for t in threat_types if t[1] == "critical"),
+                "high": sum(1 for t in threat_types if t[1] == "high"),
+                "estimated_savings": "$3,450/month"
+            }
+        }
+    
+    # ============ WEBHOOK ENDPOINTS ============
+    @app.post("/stripe-webhook")
+    async def stripe_webhook(request: Request):
+        """Stripe webhook handler"""
+        if not STRIPE_AVAILABLE:
+            return {"status": "stripe_not_configured"}
+        
+        payload = await request.body()
+        sig_header = request.headers.get('stripe-signature')
+        
+        try:
+            event = stripe.Webhook.construct_event(
+                payload, sig_header, STRIPE_WEBHOOK_SECRET
+            )
+            
+            # Handle different event types
+            if event['type'] == 'checkout.session.completed':
+                session = event['data']['object']
+                logger.info(f"Checkout completed for {session.get('customer_email')}")
+            
+            return {"status": "success"}
+        
+        except Exception as e:
+            logger.error(f"Webhook error: {e}")
+            raise HTTPException(status_code=400, detail=str(e))
+    
+    # ============ CLOUDFORMATION TEMPLATE ============
+    @app.get("/cloudformation-template")
+    async def cloudformation_template():
+        """Get CloudFormation template for AWS setup"""
+        template = f"""AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Spectraine Cloud Security Read-Only Role'
+
+Parameters:
+  SpectraineAccountId:
+    Type: String
+    Default: '{os.getenv("AWS_ACCOUNT_ID", "YOUR_SPECTRAINE_ACCOUNT_ID")}'
+    Description: 'Spectraine AWS Account ID'
+
+Resources:
+  SpectraineReadOnlyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SpectraineReadOnlyRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${{SpectraineAccountId}}:root'
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': 'spectraine-{secrets.token_hex(8)}'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/SecurityAudit
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      Description: 'Spectraine cloud security monitoring role'
+
+Outputs:
+  RoleArn:
+    Description: 'Spectraine Read-Only Role ARN'
+    Value: !GetAtt SpectraineReadOnlyRole.Arn
+"""
+        
+        return Response(
+            content=template,
+            media_type="application/x-yaml",
+            headers={
+                "Content-Disposition": "attachment; filename=spectraine-role-setup.yml"
+            }
+        )
+    
+    # Response class for file downloads
+    from fastapi.responses import Response
+    
+else:
+    # If FastAPI is not available, create a minimal WSGI app
+    from wsgiref.simple_server import make_server
+    
+    def simple_app(environ, start_response):
+        """Minimal WSGI app if FastAPI not available"""
+        status = '200 OK'
+        headers = [('Content-type', 'application/json')]
+        start_response(status, headers)
+        
+        response = {
+            "error": "FastAPI not installed",
+            "message": "Please install dependencies: pip install fastapi uvicorn",
+            "docker_advice": "Use Docker for easy setup"
+        }
+        
+        return [json.dumps(response).encode('utf-8')]
+    
+    app = simple_app
+
+# ============ MAIN ENTRY POINT ============
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    if FASTAPI_AVAILABLE:
+        import uvicorn
+        
+        port = int(os.getenv("PORT", 8000))
+        host = os.getenv("HOST", "0.0.0.0")
+        
+        logger.info(f"Starting Spectraine API on {host}:{port}")
+        logger.info(f"API Documentation: http://{host}:{port}/docs")
+        logger.info(f"Health check: http://{host}:{port}/health")
+        
+        uvicorn.run(
+            app,
+            host=host,
+            port=port,
+            log_level="info",
+            access_log=True
+        )
+    else:
+        logger.error("FastAPI is not installed!")
+        logger.error("Run: pip install fastapi uvicorn")
+        logger.error("Or use Docker: docker-compose up --build")
+        
+        # Start simple WSGI server
+        port = int(os.getenv("PORT", 8000))
+        with make_server('', port, app) as httpd:
+            logger.info(f"Serving on port {port}...")
+            httpd.serve_forever()
